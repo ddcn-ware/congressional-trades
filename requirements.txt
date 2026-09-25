@@ -1,0 +1,19 @@
+# Pipeline + dashboard dependencies
+
+# HTTP
+requests==2.32.3
+
+# Data
+pandas==2.2.2
+
+# Database
+psycopg2-binary==2.9.13   # binary wheel avoids needing libpq-dev in CI
+
+# Dashboard
+streamlit==1.35.0
+
+# Market data (VIX only — everything else via Finnhub)
+yfinance==0.2.40
+
+# Used by anomaly detection for DB reads
+# (pd.read_sql needs a live DBAPI connection, not SQLAlchemy, which psycopg2 provides directly)

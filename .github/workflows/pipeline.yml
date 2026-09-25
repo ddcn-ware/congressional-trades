@@ -1,0 +1,71 @@
+name: ETL Pipeline
+
+on:
+  # Run every day at 06:00 UTC — after US markets close (21:00 ET previous day)
+  # and before European open, so VIX/SPY/QQQ data reflects the previous session.
+  schedule:
+    - cron: "0 6 * * *"
+
+  # Allow manual trigger from the Actions tab, useful for testing and backfills.
+  workflow_dispatch:
+
+jobs:
+  run-pipeline:
+    name: Run ingestion pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 20  # hard cap — a hung network call shouldn't burn CI minutes
+
+    env:
+      DATABASE_URL:     ${{ secrets.DATABASE_URL }}
+      FINNHUB_API_KEY:  ${{ secrets.FINNHUB_API_KEY }}
+      T212_API_KEY:     ${{ secrets.T212_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+        working-directory: congressional-trades
+
+      - name: Run database migrations
+        # apply_migrations.py is idempotent (uses IF NOT EXISTS / CREATE OR REPLACE)
+        # so running it on every CI invocation is safe and ensures schema is always
+        # current without needing a separate migration-tracking table.
+        run: python migrations/apply_migrations.py
+        working-directory: congressional-trades
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Run pipeline
+        # run_pipeline.py resolves its own sys.path via __file__, so no PYTHONPATH needed.
+        run: python ingestion/run_pipeline.py
+        working-directory: congressional-trades
+        env:
+          DATABASE_URL:    ${{ secrets.DATABASE_URL }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          T212_API_KEY:    ${{ secrets.T212_API_KEY }}
+
+      - name: Verify row counts
+        # Fail the run if the DB is still empty after ingestion — a silent
+        # partial failure (e.g. empty API response) would otherwise look green.
+        run: |
+          python - <<'EOF'
+          import os, psycopg2, sys
+          conn = psycopg2.connect(os.environ["DATABASE_URL"])
+          cur = conn.cursor()
+          cur.execute("SELECT COUNT(*) FROM congressional_trades")
+          count = cur.fetchone()[0]
+          print(f"congressional_trades rows: {count}")
+          if count == 0:
+              print("ERROR: congressional_trades is empty after ingestion run", file=sys.stderr)
+              sys.exit(1)
+          EOF
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
