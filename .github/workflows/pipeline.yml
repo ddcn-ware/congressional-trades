@@ -1,60 +1,61 @@
+# GitHub Actions workflow — runs the whole pipeline in the cloud every day,
+# so the database stays up to date without my laptop being on.
+#
+# GitHub reads any .yml file in .github/workflows/ automatically. Each run
+# starts a fresh Linux machine, downloads this repo, installs Python and the
+# packages, then runs the steps below in order.
+#
+# The secret values (database URL, API keys) are stored in the repo under
+# Settings → Secrets and variables → Actions, and never appear in the code.
+
 name: ETL Pipeline
 
 on:
-  # Run every day at 06:00 UTC — after US markets close (21:00 ET previous day)
-  # and before European open, so VIX/SPY/QQQ data reflects the previous session.
+  # When to run. Cron format is "minute hour day month weekday",
+  # so "0 6 * * *" = 06:00 UTC every day — after US markets closed the night before.
   schedule:
     - cron: "0 6 * * *"
 
-  # Allow manual trigger from the Actions tab, useful for testing and backfills.
+  # Also adds a "Run workflow" button in the Actions tab, handy for testing.
   workflow_dispatch:
 
 jobs:
   run-pipeline:
     name: Run ingestion pipeline
     runs-on: ubuntu-latest
-    timeout-minutes: 20  # hard cap — a hung network call shouldn't burn CI minutes
+    timeout-minutes: 20   # kill the run if something hangs
 
+    # Make the secrets available as environment variables to every step below.
     env:
       DATABASE_URL:     ${{ secrets.DATABASE_URL }}
       FINNHUB_API_KEY:  ${{ secrets.FINNHUB_API_KEY }}
-      T212_API_KEY:     ${{ secrets.T212_API_KEY }}
+      T212_API_ID:      ${{ secrets.T212_API_ID }}
+      T212_API_SECRET:  ${{ secrets.T212_API_SECRET }}
 
     steps:
       - name: Checkout
+        # Download this repo's code onto the machine.
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
+          cache: pip   # reuse downloaded packages between runs so installs are faster
 
       - name: Install dependencies
         run: pip install -r requirements.txt
-        working-directory: congressional-trades
 
       - name: Run database migrations
-        # apply_migrations.py is idempotent (uses IF NOT EXISTS / CREATE OR REPLACE)
-        # so running it on every CI invocation is safe and ensures schema is always
-        # current without needing a separate migration-tracking table.
+        # Creates any missing tables. Safe to run every time — see migrations/apply_migrations.py.
         run: python migrations/apply_migrations.py
-        working-directory: congressional-trades
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
       - name: Run pipeline
-        # run_pipeline.py resolves its own sys.path via __file__, so no PYTHONPATH needed.
         run: python ingestion/run_pipeline.py
-        working-directory: congressional-trades
-        env:
-          DATABASE_URL:    ${{ secrets.DATABASE_URL }}
-          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-          T212_API_KEY:    ${{ secrets.T212_API_KEY }}
 
       - name: Verify row counts
-        # Fail the run if the DB is still empty after ingestion — a silent
-        # partial failure (e.g. empty API response) would otherwise look green.
+        # A final sanity check: if the trades table is somehow empty after the
+        # run, fail loudly (red cross) instead of showing a misleading green tick.
         run: |
           python - <<'EOF'
           import os, psycopg2, sys
@@ -64,8 +65,6 @@ jobs:
           count = cur.fetchone()[0]
           print(f"congressional_trades rows: {count}")
           if count == 0:
-              print("ERROR: congressional_trades is empty after ingestion run", file=sys.stderr)
+              print("ERROR: congressional_trades is empty after ingestion", file=sys.stderr)
               sys.exit(1)
           EOF
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}

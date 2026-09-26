@@ -1,24 +1,23 @@
 """
-Stage 4 — News ingestion (Finnhub).
+Stage 4 — downloads news headlines from Finnhub and saves them to the database.
 
-Two flavours stored in the same table:
-  1. General market news  — top headlines, ticker=NULL
-  2. Portfolio news       — company-specific headlines, ticker=<symbol>
+Two kinds of news go into the same "news" table:
+  - General market headlines           -> saved with ticker = NULL (empty)
+  - News about each stock I hold       -> saved with that stock's ticker
 
-Portfolio news is keyed off the tickers currently in portfolio_positions
-(latest snapshot). This stage must run after the portfolio stage so those
-rows exist.
+This stage runs after the portfolio stage, because it reads my holdings from
+the database to know which companies to fetch news for. No tickers are
+hard-coded — if I buy a new stock, its news starts showing up automatically.
 
-Finnhub free tier: 60 calls/min.
-We batch per-ticker requests with a short sleep between calls to stay
-within that limit. For large portfolios we cap at MAX_TICKERS_PER_RUN
-rather than assuming every ticker completes in time.
+Rate limits: Finnhub's free tier allows 60 requests per minute. We wait just
+over a second between each company, and cap the number of companies per run
+at MAX_TICKERS_PER_RUN, so we never go over.
 
-Dedup: (source, source_id) has a UNIQUE constraint so re-runs are safe.
+Safe to re-run: each article has an ID, and the database skips any article
+it has already saved.
 """
 
 import logging
-import math
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -30,14 +29,12 @@ from db import execute_values, get_conn, put_conn
 
 logger = logging.getLogger(__name__)
 
-FINNHUB_BASE   = "https://finnhub.io/api/v1"
-GENERAL_CAT    = "general"         # Finnhub market news category
-NEWS_LOOKBACK  = 3                 # days of news to fetch per ticker
-MAX_TICKERS_PER_RUN = 20          # safety cap; raise if portfolio grows
-# At 1 req/s we spend MAX_TICKERS_PER_RUN seconds on ticker news.
-# Keep well under the 60/min rate limit even if the general-news call
-# also runs in the same minute.
-INTER_REQUEST_SLEEP = 1.1         # seconds between per-ticker Finnhub calls
+# Settings — change these to tweak behaviour without touching the logic.
+FINNHUB_BASE        = "https://finnhub.io/api/v1"
+GENERAL_CAT         = "general"
+NEWS_LOOKBACK       = 3           # fetch company news from the last 3 days
+MAX_TICKERS_PER_RUN = 20          # safety cap; increase if the portfolio grows
+INTER_REQUEST_SLEEP = 1.1         # seconds between company requests (~54 per minute)
 
 
 def _headers() -> dict:
@@ -45,6 +42,7 @@ def _headers() -> dict:
 
 
 def _fetch_general_news(retries: int = 3) -> list[dict]:
+    """Get the latest general market headlines. Returns [] if it keeps failing."""
     url = f"{FINNHUB_BASE}/news"
     for attempt in range(1, retries + 1):
         try:
@@ -62,6 +60,7 @@ def _fetch_general_news(retries: int = 3) -> list[dict]:
 
 
 def _fetch_company_news(symbol: str, from_date: str, to_date: str, retries: int = 3) -> list[dict]:
+    """Get news about one company between two dates (format YYYY-MM-DD)."""
     url = f"{FINNHUB_BASE}/company-news"
     for attempt in range(1, retries + 1):
         try:
@@ -72,8 +71,7 @@ def _fetch_company_news(symbol: str, from_date: str, to_date: str, retries: int 
                 timeout=15,
             )
             resp.raise_for_status()
-            data = resp.json()
-            return data
+            return resp.json()
         except requests.RequestException as exc:
             if attempt == retries:
                 logger.error("Company news fetch failed for %s: %s", symbol, exc)
@@ -84,11 +82,13 @@ def _fetch_company_news(symbol: str, from_date: str, to_date: str, retries: int 
 
 def _held_tickers(conn) -> list[str]:
     """
-    Return tickers from the latest portfolio snapshot.
-    If the portfolio stage failed or hasn't run yet, returns an empty list
-    so news ingestion degrades gracefully rather than crashing.
+    Return the tickers I currently hold (from the latest portfolio snapshot).
+    If the portfolio stage hasn't run yet this returns [], and we just save
+    general news instead of failing.
     """
     with conn.cursor() as cur:
+        # DISTINCT ON (ticker) + ORDER BY snapshotted_at DESC is a PostgreSQL
+        # trick for "give me only the newest row for each ticker".
         cur.execute(
             """
             SELECT DISTINCT ON (ticker) ticker
@@ -101,23 +101,20 @@ def _held_tickers(conn) -> list[str]:
 
 
 def _news_to_rows(articles: list[dict], ticker: str | None) -> list[tuple]:
-    """
-    Map raw Finnhub article dicts into tuples matching the news table schema.
-    ticker=None for general headlines.
-    """
+    """Convert Finnhub's article format into tuples matching our news table columns."""
     rows = []
     for a in articles:
         raw_id = a.get("id")
-        # Finnhub sometimes returns id=0 (integer zero) for general news — treat
-        # that as missing since 0 isn't a useful dedup key and would cause all
-        # such articles to conflict with each other on (source, source_id).
+        # We need a unique ID per article to skip duplicates. Finnhub sometimes
+        # gives general news an id of 0 — if we used that, every such article
+        # would look like the same one. So in that case we make our own ID by
+        # hashing the headline + timestamp.
         source_id = str(raw_id) if raw_id not in (None, 0, "", "0") else ""
         if not source_id:
-            # Fall back to a hash of headline + published timestamp so we still
-            # get dedup without a real id.
             import hashlib
             fingerprint = f"{a.get('headline','')}{a.get('datetime','')}"
             source_id = "hash:" + hashlib.sha1(fingerprint.encode()).hexdigest()
+        # Finnhub gives times as a Unix timestamp (seconds since 1 Jan 1970).
         published_ts = a.get("datetime")
         published_at = (
             datetime.fromtimestamp(published_ts, tz=timezone.utc) if published_ts else None
@@ -145,30 +142,29 @@ def run() -> dict[str, Any]:
 
     all_rows: list[tuple] = []
 
-    # ── General market news ───────────────────────────────────────────────────
+    # 1) General market news
     general = _fetch_general_news()
     all_rows.extend(_news_to_rows(general, ticker=None))
 
-    # ── Portfolio-scoped news ─────────────────────────────────────────────────
+    # 2) Find out which stocks I hold
     conn = get_conn()
     try:
         tickers = _held_tickers(conn)
     finally:
         put_conn(conn)
 
+    # 3) Fetch news for each of those stocks
     if not tickers:
-        logger.info("No portfolio tickers found — only general news will be stored")
+        logger.info("No portfolio tickers found — storing general news only")
     else:
-        today = datetime.now(timezone.utc).date()
+        today     = datetime.now(timezone.utc).date()
         from_date = (today - timedelta(days=NEWS_LOOKBACK)).isoformat()
-        to_date = today.isoformat()
+        to_date   = today.isoformat()
 
-        # Cap to avoid blowing through the rate limit on a large portfolio
         tickers_to_fetch = tickers[:MAX_TICKERS_PER_RUN]
         if len(tickers) > MAX_TICKERS_PER_RUN:
             logger.warning(
-                "Portfolio has %d tickers but MAX_TICKERS_PER_RUN=%d; "
-                "remaining tickers will be picked up on future runs",
+                "Portfolio has %d tickers; capped at %d this run — rest picked up next time",
                 len(tickers), MAX_TICKERS_PER_RUN,
             )
 
@@ -176,17 +172,15 @@ def run() -> dict[str, Any]:
             articles = _fetch_company_news(ticker, from_date, to_date)
             all_rows.extend(_news_to_rows(articles, ticker=ticker))
             logger.debug("Fetched %d articles for %s", len(articles), ticker)
-
-            # Pace requests to stay within 60/min.
-            # We don't need to sleep after the last ticker.
+            # Pause between requests to respect the rate limit (no need after the last one).
             if i < len(tickers_to_fetch) - 1:
                 time.sleep(INTER_REQUEST_SLEEP)
 
-    # ── Bulk insert ───────────────────────────────────────────────────────────
     if not all_rows:
         logger.info("No news rows to insert")
         return {"stage": "news", "inserted": 0}
 
+    # 4) Save everything, skipping articles we already have.
     sql = """
         INSERT INTO news (headline, summary, url, source_name, ticker, published_at, source, source_id)
         VALUES %s
@@ -194,8 +188,8 @@ def run() -> dict[str, Any]:
     """
     inserted = execute_values(sql, all_rows)
     logger.info(
-        "News ingestion: %d candidate rows, %d newly inserted (rest were duplicates)",
-        len(all_rows), inserted,
+        "News: %d candidates, %d inserted (%d duplicates skipped)",
+        len(all_rows), inserted, len(all_rows) - inserted,
     )
 
     summary = {

@@ -1,11 +1,13 @@
 """
-One-off backfill script — seeds market_context with 90 days of
-historical daily closes for SPY, QQQ, and ^VIX.
+One-off script: fills the database with the last 90 days of SPY, QQQ and VIX prices.
 
-Run once:
+Why? The daily pipeline only saves one price per day, so on day one the market
+charts would be empty. Run this once after setting up the database so the
+charts have 90 days of history straight away.
+
     python scripts/backfill_market_context.py
 
-Uses Yahoo Finance v8 chart API (no key needed).
+Uses Yahoo Finance's chart API, which doesn't need an API key.
 """
 
 import os
@@ -13,6 +15,7 @@ import sys
 import logging
 from datetime import datetime, timezone
 
+# Let us import db.py from the ingestion/ folder.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ingestion"))
 
 import requests
@@ -21,20 +24,24 @@ from db import execute_values
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
 logger = logging.getLogger(__name__)
 
+# Symbol as we store it -> symbol as it goes in the URL.
+# "^" isn't allowed in URLs, so ^VIX is written as %5EVIX.
 SYMBOLS = {
     "SPY":  "SPY",
     "QQQ":  "QQQ",
     "^VIX": "%5EVIX",
 }
 
+# Tag these rows so we can tell backfilled data apart from the daily pipeline's.
 SOURCE_MAP = {
-    "SPY":  "finnhub_backfill",
-    "QQQ":  "finnhub_backfill",
+    "SPY":  "yahoo_backfill",
+    "QQQ":  "yahoo_backfill",
     "^VIX": "yahoo_backfill",
 }
 
 
 def fetch_history(symbol_url: str, days: int = 90) -> list[tuple]:
+    """Return a list of (unix_timestamp, closing_price) pairs, one per trading day."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol_url}"
     resp = requests.get(
         url,
@@ -47,6 +54,7 @@ def fetch_history(symbol_url: str, days: int = 90) -> list[tuple]:
     result = data["chart"]["result"][0]
     timestamps = result["timestamps"] if "timestamps" in result else result.get("timestamp", [])
     closes = result["indicators"]["quote"][0]["close"]
+    # zip pairs up the two lists: [(t1, c1), (t2, c2), ...]
     return list(zip(timestamps, closes))
 
 
@@ -59,10 +67,11 @@ def run():
             source = SOURCE_MAP[symbol]
             prev_close = None
             for ts, close in history:
-                if close is None:
+                if close is None:  # Yahoo sometimes has gaps — skip them
                     prev_close = close
                     continue
                 fetched_at = datetime.fromtimestamp(ts, tz=timezone.utc)
+                # Daily % change compared with the day before
                 change_pct = ((close - prev_close) / prev_close * 100) if prev_close else None
                 rows.append((symbol, close, change_pct, fetched_at, source))
                 prev_close = close
@@ -79,9 +88,6 @@ def run():
         VALUES %s
         ON CONFLICT DO NOTHING
     """
-    # market_context has no unique constraint — insert all, duplicates will just
-    # add extra rows which the dashboard handles fine (it uses DISTINCT ON symbol
-    # for the snapshot and ORDER BY fetched_at for charts)
     inserted = execute_values(sql, rows)
     logger.info("Inserted %d historical market context rows", inserted)
 
