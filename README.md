@@ -2,7 +2,9 @@
 
 A personal dashboard that shows which stocks US politicians are trading, whether any of them are stocks **I** own, and whether anything looks unusual.
 
-Members of the US House of Representatives have to publicly report their stock trades within 45 days (a law called the STOCK Act). There's a lot of noise online about "politicians beating the market", but most of it is vague or cherry-picked. I invest in individual companies myself, so I wanted to look at the real data and check it against my own portfolio.
+I manage a personal stock portfolio — around £20k — and I pick individual companies rather than just buying ETFs. Which means I actually read through financials, watch sector movements, and think about what's moving prices. Congressional trading data kept coming up in my research. There's a lot of noise about it online but most takes are vague or cherry-picked, so I wanted to look at the actual numbers myself.
+
+Members of the US House of Representatives have to publicly report their stock trades within 45 days (a law called the STOCK Act). This project pulls that real disclosure data and checks it against my own portfolio.
 
 I'm a second-year Computer Science student at KCL, and I wanted to build something with a full data stack — collecting data, storing it in a real database, running it automatically every day, and showing it in a dashboard — rather than a notebook that runs once.
 
