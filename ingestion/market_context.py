@@ -1,17 +1,21 @@
 """
-Stage 3 — Market context ingestion.
+Stage 3 — records today's market "weather": SPY, QQQ and the VIX.
 
-SPY and QQQ via Finnhub (equity/ETF endpoint — the same endpoint used
-everywhere else, works fine on the free tier).
+  SPY  = a fund that tracks the S&P 500 (the 500 biggest US companies)
+  QQQ  = a fund that tracks the Nasdaq-100 (mostly big tech)
+  ^VIX = the "fear index" — how much volatility traders expect. High = nervous market.
 
-VIX via yfinance specifically because Finnhub's free tier doesn't cover
-raw index symbols like ^VIX, and VIXY/UVXY track VIX futures (not the
-index itself), making them unsuitable proxies for implied volatility.
-yfinance is an unofficial scraper so we wrap it defensively and fall back
-to the last cached value rather than failing the whole stage.
+SPY and QQQ come from Finnhub, the same free API used for news.
 
-All three are written to market_context so the dashboard reads from DB,
-not from live API calls on page load.
+VIX is trickier. Finnhub's free tier doesn't include raw indexes like ^VIX,
+and the VIX funds you can buy (VIXY, UVXY) track VIX *futures*, which drift
+away from the real index — so they're not a fair substitute. Instead we call
+Yahoo Finance's chart API directly. It's unofficial, so it's wrapped in a
+try/except: if Yahoo blocks us, we reuse the last VIX value we saved rather
+than crashing the stage.
+
+Everything is saved to the database, so the dashboard just reads from there
+and never has to wait on these APIs when the page loads.
 """
 
 import logging
@@ -31,14 +35,17 @@ MARKET_ETFS = ["SPY", "QQQ"]
 
 
 def _finnhub_headers() -> dict:
+    """Finnhub identifies us by an API key sent in a header."""
     return {"X-Finnhub-Token": os.environ["FINNHUB_API_KEY"]}
 
 
 def _fetch_finnhub_quote(symbol: str, retries: int = 3) -> dict | None:
     """
-    Fetch a real-time quote from Finnhub.
-    Returns the raw quote dict or None on failure so the caller can decide
-    whether to skip or raise.
+    Get the latest price for a symbol from Finnhub.
+
+    Finnhub's reply uses one-letter keys: "c" = current price,
+    "pc" = previous day's closing price. Returns None if there's no data,
+    and lets the caller decide what to do about it.
     """
     url = f"{FINNHUB_BASE}/quote"
     for attempt in range(1, retries + 1):
@@ -51,29 +58,31 @@ def _fetch_finnhub_quote(symbol: str, retries: int = 3) -> dict | None:
             )
             resp.raise_for_status()
             data = resp.json()
-            # Finnhub returns {"c":0,"d":null,...} for unknown symbols — treat c==0 as failure
+            # A price of 0 means Finnhub doesn't know this symbol.
             if not data.get("c"):
-                logger.warning("Finnhub returned empty/zero quote for %s", symbol)
+                logger.warning("Finnhub returned empty quote for %s", symbol)
                 return None
             return data
         except requests.RequestException as exc:
             if attempt == retries:
                 logger.error("Finnhub quote fetch failed for %s after %d attempts: %s", symbol, retries, exc)
                 return None
-            time.sleep(2 ** attempt)
+            time.sleep(2 ** attempt)  # wait 2s, then 4s, before retrying
     return None
 
 
 def _fetch_vix_yfinance() -> tuple[float | None, float | None]:
     """
-    Fetch the current VIX level via Yahoo Finance's v8 chart API directly.
-    yfinance's wrapper is broken against Python 3.12/3.14 and Yahoo's scraping
-    blocks, but the underlying JSON endpoint works fine with a browser UA.
+    Get the current VIX level from Yahoo Finance's chart API.
+    Returns (price, % change since yesterday), or (None, None) if it fails.
     """
     try:
         resp = requests.get(
+            # %5E is the URL-safe way of writing "^" (so this is ^VIX)
             "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX",
             params={"interval": "1d", "range": "5d"},
+            # Yahoo rejects requests that don't look like they come from a browser,
+            # so we send a normal browser "User-Agent".
             headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
             timeout=15,
         )
@@ -90,11 +99,7 @@ def _fetch_vix_yfinance() -> tuple[float | None, float | None]:
 
 
 def _last_cached_value(symbol: str, conn) -> tuple[float | None, float | None]:
-    """
-    Return the most recently cached (price, change_pct) for a symbol.
-    Used as a fallback when the live fetch fails so the dashboard always
-    has something to display rather than a blank chart.
-    """
+    """Look up the most recent price we saved for a symbol — the VIX backup plan."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -118,26 +123,25 @@ def run() -> dict[str, Any]:
         logger.warning("FINNHUB_API_KEY not set — skipping market context stage")
         return {"stage": "market_context", "skipped": True}
 
-    rows = []
+    rows = []  # each row = (symbol, price, change_pct, time, source)
     now = datetime.now(timezone.utc)
 
-    # ── SPY and QQQ via Finnhub ───────────────────────────────────────────────
+    # 1) SPY and QQQ from Finnhub
     for symbol in MARKET_ETFS:
         quote = _fetch_finnhub_quote(symbol)
         if quote:
-            price = quote["c"]                                  # current price
+            price = quote["c"]
             prev_close = quote.get("pc")
             change_pct = ((price - prev_close) / prev_close * 100) if prev_close else None
             rows.append((symbol, price, change_pct, now, "finnhub"))
             logger.info("%s: %.2f (%.2f%%)", symbol, price, change_pct or 0)
         else:
-            logger.warning("No quote for %s — skipping this symbol this run", symbol)
+            logger.warning("No quote for %s — skipping this run", symbol)
 
-    # ── VIX via yfinance ──────────────────────────────────────────────────────
+    # 2) VIX from Yahoo, falling back to the last saved value if Yahoo fails
     vix_price, vix_change = _fetch_vix_yfinance()
 
     if vix_price is None:
-        # Fall back to last cached value rather than writing a null row
         conn = get_conn()
         try:
             vix_price, vix_change = _last_cached_value("^VIX", conn)
@@ -157,6 +161,8 @@ def run() -> dict[str, Any]:
         logger.warning("No market context rows to insert this run")
         return {"stage": "market_context", "inserted": 0}
 
+    # 3) Save everything in one insert. We always add new rows (never update),
+    # which builds up a price history the dashboard can chart.
     sql = """
         INSERT INTO market_context (symbol, price, change_pct, fetched_at, source)
         VALUES %s

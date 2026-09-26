@@ -1,136 +1,169 @@
 # Congressional Trading Tracker
 
-I manage a personal stock portfolio — currently around £20k — and I pick individual companies rather than just buying ETFs. That means I actually spend time reading financials, watching sector movements, and thinking about what's driving prices. One thing that kept coming up in my research was congressional trading data. There's been a lot of noise about it online, but most of the takes I saw were either vague or cherry-picked. I wanted to look at the actual numbers myself.
+A personal dashboard that shows which stocks US politicians are trading, whether any of them are stocks **I** own, and whether anything looks unusual.
 
-So I built a pipeline that pulls the real disclosure data, stores it in a database, and surfaces it in a dashboard I can actually use — alongside my own portfolio and some market context. The idea was to see whether any of the stocks I'm holding have been recently traded by members of Congress, and whether there are any patterns worth paying attention to.
+Members of the US House of Representatives have to publicly report their stock trades within 45 days (a law called the STOCK Act). There's a lot of noise online about "politicians beating the market", but most of it is vague or cherry-picked. I invest in individual companies myself, so I wanted to look at the real data and check it against my own portfolio.
 
-This is a proper personal project. I'm a first-year CS student at King's College London, and I wanted something that used the full stack — data engineering, a live database, scheduled automation, and a frontend — not just a notebook I run once.
+I'm a first-year Computer Science student at KCL, and I wanted to build something with a full data stack — collecting data, storing it in a real database, running it automatically every day, and showing it in a dashboard — rather than a notebook that runs once.
 
 ---
 
 ## What it does
 
-- Pulls House of Representatives stock trade disclosures daily (every member has to report within 45 days under the STOCK Act)
-- Cleans and stores them in PostgreSQL — member name, ticker, buy/sell, amount range, dates
-- Detects anomalies: tickers with unusual trade volume spikes, and clusters of buys/sells before significant price moves
-- Tracks my own Trading 212 portfolio positions and cross-references each stock I hold against recent congressional activity
-- Pulls SPY, QQQ, and VIX for market context
-- Fetches market news and per-ticker news for whatever I'm holding
-- Runs all of this on a daily schedule via GitHub Actions and serves it through a Streamlit dashboard
-
-The dashboard opens on your portfolio and market charts first, then congressional data and anomalies below — because that's actually the order I care about when I check it.
+- **Collects** every House trade disclosure (who, which stock, buy or sell, how much, when).
+- **Stores** it in a PostgreSQL database, cleaned up and with no duplicates.
+- **Flags anything unusual** — a stock suddenly getting traded much more than normal, or several politicians making the same bet within two weeks.
+- **Checks my portfolio** (Trading 212) and puts a 🏛️ next to any stock I hold that a politician recently traded.
+- **Adds context** — S&P 500, Nasdaq and VIX prices, plus market news and news about my holdings.
+- **Runs itself** every morning using GitHub Actions.
 
 ---
 
-## A few decisions I made along the way
+## How it works
 
-**House-only, not House + Senate.** The Senate equivalent of the data source I wanted to use had gone stale — it wasn't being reliably updated anymore. Rather than mix dead Senate data in as if it were live, I scoped this to House-only. If I wanted Senate coverage I'd need to pay for it through a provider like Quiver Quantitative. That's a future thing.
+There are two halves: a **pipeline** that collects data once a day, and a **dashboard** that reads it.
 
-**Why Finnhub and not just yfinance for everything.** Finnhub has a proper free tier with a documented API — 60 calls per minute, covers equity quotes, company news, and price candles. yfinance is an unofficial scraper that works until it doesn't. I used it specifically for VIX because Finnhub's free tier doesn't cover raw index symbols, but I wrapped it defensively so if Yahoo blocks the request the pipeline falls back to the last cached value rather than crashing.
+```
+          ┌──────────── PIPELINE (runs daily at 06:00 UTC on GitHub Actions) ────────────┐
+          │                                                                              │
+          │  1. congressional_trades.py  download trades CSV → clean → save              │
+          │  2. portfolio.py             get my Trading 212 holdings → save              │
+          │  3. market_context.py        get SPY, QQQ, VIX prices → save                 │
+          │  4. news.py                  get headlines (general + my stocks) → save      │
+          │  5. anomaly_detection.py     scan trades for unusual patterns → save         │
+          │                                                                              │
+          └──────────────────────────────────────┬───────────────────────────────────────┘
+                                                 ▼
+                                   ┌──────────────────────────┐
+                                   │   PostgreSQL database    │
+                                   └────────────┬─────────────┘
+                                                ▼
+                                   ┌──────────────────────────┐
+                                   │  Streamlit dashboard     │  ← what I look at
+                                   └──────────────────────────┘
+```
 
-**Why Streamlit and not a custom frontend.** Honestly, because the project is about the data, not the UI. Streamlit lets me write everything in Python, deploy for free on Streamlit Community Cloud, and have a usable dashboard without writing a single line of JavaScript. If this were a product I'd reconsider, but for a personal project it's the right call.
+A few things that make it reliable:
 
-**The data source changed mid-build.** I originally planned to use House Stock Watcher, which was the main community mirror for this data. It went offline while I was building. I ended up pulling directly from the official House Clerk disclosure ZIPs first, but those only give you filing-level records with no ticker detail — the actual trade information is buried in PDFs. I found a community-maintained CSV (insiderwatch-data) that parses those PDFs and publishes ticker-level data. That's what the pipeline uses now.
+- **Stages are independent.** If one fails (say Trading 212 is down), the others still run. The run is still marked as failed in GitHub so I notice.
+- **Re-running is safe.** Every trade and article has a unique ID, and the database skips anything it has already saved, so no duplicates.
+- **The dashboard mostly reads from the database**, so it loads fast and doesn't depend on outside APIs being up. The one exception is the "Today" chart, which fetches live prices every 5 minutes.
+
+### How the anomaly detection works
+
+1. **Volume spike** — for each stock, count the trades per week and work out what's normal *for that stock*. A week is flagged if it's more than 2 standard deviations above normal (a z-score test). Comparing each stock to its own history means a quiet stock jumping to 5 trades gets flagged, but Apple at 5 trades doesn't.
+2. **Cluster** — slide a 14-day window along each stock's history. Flag it if 3+ trades went the same way (all buys or all sells) by 2+ different politicians. It then tries to check whether the price moved 5%+ over the next 30 days.
 
 ---
 
-## Dashboard
+## What's in each folder
 
-Single page, everything visible at a glance:
-
-- **Top bar** — total trades, unique members, tickers, anomaly count, portfolio size, VIX
-- **Row 1** — Portfolio positions with P&L (left) | SPY/QQQ/VIX charts (right)
-- **Row 2** — Congressional trades with top tickers, weekly volume, and trade table (left) | Flagged anomalies (right)
-- **Row 3** — Market news feed (collapsed by default, click to expand)
-
-If a stock I'm holding has been traded by members of Congress in the last 30 days, it shows a 🏛️ flag next to it in the portfolio view. Click the row to see exactly who traded it and when.
-
----
-
-## Tech stack
-
-| Layer | Tool |
+| Folder / file | What it's for |
 |---|---|
-| Language | Python |
-| Data cleaning | Pandas |
-| Database | PostgreSQL (Neon — free managed instance) |
-| Scheduling | GitHub Actions (daily cron) |
-| Dashboard | Streamlit |
-| Market data | Finnhub (SPY, QQQ, news) + Yahoo Finance v8 (VIX) |
-| Portfolio | Trading 212 read-only API |
-| Disclosure data | insiderwatch-data (community CSV, House Clerk source) |
+| `ingestion/` | The pipeline stages that fetch and save data |
+| `ingestion/run_pipeline.py` | Runs every stage in order — **start here** |
+| `ingestion/db.py` | Shared database connection code |
+| `anomaly/anomaly_detection.py` | The two unusual-pattern detectors |
+| `dashboard/app.py` | The dashboard page layout |
+| `dashboard/db_queries.py` | Every database query the dashboard uses |
+| `migrations/` | SQL that creates the database tables |
+| `scripts/backfill_market_context.py` | One-off script to load 90 days of past market prices |
+| `.github/workflows/pipeline.yml` | The daily schedule for GitHub Actions |
+| `.env.example` | Template for your secret keys |
+
+Each file starts with a comment explaining what it does and why.
 
 ---
 
-## How it's built
+## Tech used
 
-```
-GitHub Actions (runs daily at 06:00 UTC)
-│
-├── Stage 1: congressional_trades.py   — fetch CSV, clean, load to DB
-├── Stage 2: portfolio.py              — fetch T212 positions, snapshot to DB
-├── Stage 3: market_context.py         — fetch SPY, QQQ, VIX, store to DB
-├── Stage 4: news.py                   — fetch Finnhub headlines, store to DB
-└── Stage 5: anomaly_detection.py      — read trades, detect spikes/clusters, write flags
-
-Streamlit dashboard
-└── reads from DB only — no live API calls on page load
-```
-
-Each stage is isolated. If one fails, the others still run. The pipeline exits with a non-zero code if any stage fails, which makes failures visible in the GitHub Actions UI rather than silently passing.
+| Job | Tool | Why |
+|---|---|---|
+| Language | Python | Everything, including the dashboard, in one language |
+| Data cleaning | pandas | Standard tool for working with tables of data |
+| Database | PostgreSQL (hosted free on Neon) | A real relational database with proper constraints |
+| Scheduling | GitHub Actions | Free, and runs in the cloud without my laptop |
+| Dashboard | Streamlit + Altair | Web dashboard written in pure Python |
+| Trade data | [insiderwatch-data](https://github.com/saminjafari/insiderwatch-data) | Free CSV of House disclosures with tickers |
+| Prices & news | Finnhub (free tier) | Documented API: 60 calls/minute |
+| VIX & intraday prices | Yahoo Finance chart API | Finnhub's free tier doesn't include the VIX |
+| Portfolio | Trading 212 API (read-only key) | Where my investments are |
 
 ---
 
-## Setup
+## Running it yourself
 
-### 1. Database
+You need Python 3.12 and a free Postgres database from [neon.tech](https://neon.tech).
 
-Create a free Postgres instance at [neon.tech](https://neon.tech). Copy the connection string.
+**1. Install**
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/congressional-trades
+git clone https://github.com/ddcn-ware/congressional-trades
 cd congressional-trades
 python3.12 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+```
+
+**2. Add your keys.** Copy the template and fill in the four values:
+
+```bash
 cp .env.example .env
-# fill in DATABASE_URL, FINNHUB_API_KEY, T212_API_KEY in .env
-DATABASE_URL="your-connection-string" python3 migrations/apply_migrations.py
 ```
 
-### 2. Seed historical market data (one-off)
+**3. Load the keys into your terminal.** Run this in every new terminal window before the commands below:
 
 ```bash
 set -a && source .env && set +a
-python3 scripts/backfill_market_context.py
 ```
 
-### 3. Run the pipeline
+**4. Create the tables, then load some price history (one time only)**
 
 ```bash
-set -a && source .env && set +a
-python3 ingestion/run_pipeline.py
+python migrations/apply_migrations.py
+python scripts/backfill_market_context.py
 ```
 
-### 4. Run the dashboard
+**5. Run the pipeline**
+
+```bash
+python ingestion/run_pipeline.py
+```
+
+**6. Open the dashboard** at http://localhost:8501
 
 ```bash
 cd dashboard && streamlit run app.py
 ```
 
-### 5. GitHub Actions
+**7. (Optional) Run it daily in the cloud.** In your GitHub repo go to *Settings → Secrets and variables → Actions* and add `DATABASE_URL`, `FINNHUB_API_KEY`, `T212_API_ID` and `T212_API_SECRET`. The workflow then runs every morning, and you can also trigger it from the *Actions* tab.
 
-Add `DATABASE_URL`, `FINNHUB_API_KEY`, and `T212_API_KEY` as repository secrets. The workflow in `.github/workflows/pipeline.yml` handles the rest — it runs daily, applies migrations, runs the pipeline, and verifies row counts after each run.
+---
 
-### 6. Streamlit Community Cloud
+## Decisions I made along the way
 
-Point deployment at `dashboard/app.py`. Set the three env vars as Streamlit secrets.
+**House only, not Senate.** The free Senate data source stopped updating. I'd rather show only live data than mix in old Senate data as if it were current. Quiver Quantitative has Senate data, but it's paid.
+
+**The data source changed mid-build.** I planned to use House Stock Watcher, but it went offline while I was building this. The official House Clerk files only list filings, and the actual trades are inside PDFs. So I switched to insiderwatch-data, a community project that pulls the trades out of those PDFs.
+
+**Finnhub for most data, Yahoo just for the VIX.** Finnhub has a proper, documented free tier. Yahoo's API is unofficial and can break without warning. But Finnhub's free tier doesn't include the VIX index, and the VIX funds you can buy (VIXY, UVXY) track futures rather than the index itself. So the VIX comes from Yahoo, and if Yahoo fails the pipeline reuses the last saved value.
+
+**Streamlit instead of a custom website.** This project is about the data, not the UI. Streamlit let me build the whole dashboard in Python. For a real product I'd build a proper frontend.
+
+---
+
+## Limitations (being honest)
+
+- **Disclosures are late.** Members have up to 45 days to report a trade, and in this data the average gap is about 50 days. So this tool shows what happened, not what's about to happen. It can't be used to trade ahead of politicians.
+- **The price check on clusters usually doesn't run.** Finnhub's free tier blocks historical price requests, so most clusters are saved without the "did the price move?" check.
+- **Re-running detection saves duplicate anomalies.** Each run adds its results again instead of skipping ones already found.
+- **A few dates in the source data are wrong** (e.g. trade dates after the filing date). They're kept as-is for now.
 
 ---
 
 ## What I'd add next
 
-- **Alerts** — email or Slack notification when a new anomaly is detected, rather than having to check the dashboard manually. The data is already there, it just needs a notifier step.
-- **Senate coverage** — Quiver Quantitative has a Senate trading API. It's a paid tier but not expensive. Worth it if I keep using this regularly.
-- **Member drill-down** — click a member's name and see their full trade history with a timeline. All the data is in the DB already, it's just a dashboard feature.
-- **Proper dedup on anomalies** — right now re-running detection appends new rows even if the same anomaly was already flagged. Adding a unique constraint on `(ticker, window_start, anomaly_type)` would fix that.
-- **More portfolio metrics** — sector exposure, concentration risk, that sort of thing. Would need a mapping from ticker to sector which Finnhub can provide.
+- **Alerts** — a message when a new anomaly shows up, so I don't have to check the dashboard.
+- **Anomaly de-duplication** — a unique rule on `(ticker, window_start, anomaly_type)` so re-runs don't save copies.
+- **Member pages** — click a politician's name to see their full trading history. The data's already in the database.
+- **Senate coverage** via Quiver Quantitative.
+- **Sector breakdown** of my portfolio using Finnhub's company profiles.
