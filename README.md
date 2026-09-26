@@ -4,7 +4,7 @@ A personal dashboard that shows which stocks US politicians are trading, whether
 
 Members of the US House of Representatives have to publicly report their stock trades within 45 days (a law called the STOCK Act). There's a lot of noise online about "politicians beating the market", but most of it is vague or cherry-picked. I invest in individual companies myself, so I wanted to look at the real data and check it against my own portfolio.
 
-I'm a first-year Computer Science student at KCL, and I wanted to build something with a full data stack — collecting data, storing it in a real database, running it automatically every day, and showing it in a dashboard — rather than a notebook that runs once.
+I'm a second-year Computer Science student at KCL, and I wanted to build something with a full data stack — collecting data, storing it in a real database, running it automatically every day, and showing it in a dashboard — rather than a notebook that runs once.
 
 ---
 
